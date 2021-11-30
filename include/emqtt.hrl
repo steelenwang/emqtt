@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2019 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -16,13 +16,6 @@
 
 -ifndef(EMQTT_HRL).
 -define(EMQTT_HRL, true).
-
-%%--------------------------------------------------------------------
-%% MQTT SockOpts
-%%--------------------------------------------------------------------
-
--define(MQTT_SOCKOPTS, [binary, {packet, raw}, {reuseaddr, true},
-                        {backlog, 512}, {nodelay, true}]).
 
 %%--------------------------------------------------------------------
 %% MQTT Protocol Version and Names
@@ -538,5 +531,8 @@
                 }).
 
 -define(PACKET(Type), #mqtt_packet{header = #mqtt_packet_header{type = Type}}).
+
+-define(catch_error(Error, Exp),
+        try (Exp) catch error:Error -> ok end).
 
 -endif.

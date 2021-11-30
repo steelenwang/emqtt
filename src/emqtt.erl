@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2019 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -26,6 +26,7 @@
 
 -export([ connect/1
         , ws_connect/1
+        , quic_connect/1
         , disconnect/1
         , disconnect/2
         , disconnect/3
@@ -66,13 +67,15 @@
 
 %% For test cases
 -export([ pause/1
-	, resume/1
-	]).
+        , resume/1
+        ]).
 
 -export([ initialized/3
         , waiting_for_connack/3
         , connected/3
         , inflight_full/3
+        , random_client_id/0
+        , reason_code_name/1
         ]).
 
 -export([ init/1
@@ -81,6 +84,7 @@
         , terminate/3
         , code_change/4
         ]).
+
 
 -export_type([ host/0
              , option/0
@@ -97,9 +101,12 @@
 %% Message handler is a set of callbacks defined to handle MQTT messages
 %% as well as the disconnect event.
 -define(NO_MSG_HDLR, undefined).
--type(msg_handler() :: #{puback := fun((_) -> any()),
-                         publish := fun((emqx_types:message()) -> any()),
-                         disconnected := fun(({reason_code(), _Properties :: term()}) -> any())
+
+-type(mfas() :: {module(), atom(), list()} | {function(), list()}).
+
+-type(msg_handler() :: #{puback := fun((_) -> any()) | mfas(),
+                         publish := fun((emqx_types:message()) -> any()) | mfas(),
+                         disconnected := fun(({reason_code(), _Properties :: term()}) -> any()) | mfas()
                         }).
 
 -type(option() :: {name, atom()}
@@ -130,24 +137,24 @@
                 | {auto_ack, boolean()}
                 | {ack_timeout, pos_integer()}
                 | {force_ping, boolean()}
+                | {low_mem, boolean()}
                 | {properties, properties()}).
 
 -type(maybe(T) :: undefined | T).
 -type(topic() :: binary()).
 -type(payload() :: iodata()).
--type(packet_id() :: 0..16#FF).
+-type(packet_id() :: 0..16#FFFF).
 -type(reason_code() :: 0..16#FF).
 -type(properties() :: #{atom() => term()}).
 -type(version() :: ?MQTT_PROTO_V3
-      		 | ?MQTT_PROTO_V4
-		 | ?MQTT_PROTO_V5).
+                 | ?MQTT_PROTO_V4
+                 | ?MQTT_PROTO_V5).
 -type(qos() :: ?QOS_0 | ?QOS_1 | ?QOS_2).
 -type(qos_name() :: qos0 | at_most_once |
                     qos1 | at_least_once |
                     qos2 | exactly_once).
 -type(pubopt() :: {retain, boolean()}
-      		| {qos, qos() | qos_name()}
-		| {timeout, timeout()}).
+                | {qos, qos() | qos_name()}).
 -type(subopt() :: {rh, 0 | 1 | 2}
                 | {rap, boolean()}
                 | {nl,  boolean()}
@@ -156,7 +163,7 @@
 -type(subscribe_ret() ::
       {ok, properties(), [reason_code()]} | {error, term()}).
 
--type(conn_mod() :: emqtt_sock | emqtt_ws).
+-type(conn_mod() :: emqtt_sock | emqtt_ws | emqtt_quic).
 
 -type(client() :: pid() | atom()).
 
@@ -199,6 +206,7 @@
           retry_timer     :: reference(),
           session_present :: boolean(),
           last_packet_id  :: packet_id(),
+          low_mem         :: boolean(),
           parse_state     :: emqtt_frame:parse_state()
          }).
 
@@ -206,6 +214,7 @@
 
 %% Default timeout
 -define(DEFAULT_KEEPALIVE, 60).
+-define(DEFAULT_RETRY_INTERVAL, 30000).
 -define(DEFAULT_ACK_TIMEOUT, 30000).
 -define(DEFAULT_CONNECT_TIMEOUT, 60000).
 
@@ -239,11 +248,21 @@ start_link(Options) when is_map(Options) ->
 start_link(Options) when is_list(Options) ->
     ok = emqtt_props:validate(
             proplists:get_value(properties, Options, #{})),
+    StatmOpts = case proplists:get_bool(low_mem, Options) of
+                    false -> [];
+                    true ->
+                        [{spawn_opt, [{min_heap_size, 16},
+                                      {min_bin_vheap_size,16}
+                                     ]},
+                         {hibernate_after, 50}
+                        ]
+                end,
+
     case proplists:get_value(name, Options) of
         undefined ->
-            gen_statem:start_link(?MODULE, [with_owner(Options)], []);
+            gen_statem:start_link(?MODULE, [with_owner(Options)], StatmOpts);
         Name when is_atom(Name) ->
-            gen_statem:start_link({local, Name}, ?MODULE, [with_owner(Options)], [])
+            gen_statem:start_link({local, Name}, ?MODULE, [with_owner(Options)], StatmOpts)
     end.
 
 with_owner(Options) ->
@@ -258,6 +277,9 @@ connect(Client) ->
 
 ws_connect(Client) ->
     call(Client, {connect, emqtt_ws}).
+
+quic_connect(Client) ->
+    call(Client, {connect, emqtt_quic}).
 
 %% @private
 call(Client, Req) ->
@@ -323,7 +345,9 @@ parse_subopt([{nl, true} | Opts], Result) ->
 parse_subopt([{nl, false} | Opts], Result) ->
     parse_subopt(Opts, Result#{nl := 0});
 parse_subopt([{qos, QoS} | Opts], Result) ->
-    parse_subopt(Opts, Result#{qos := ?QOS_I(QoS)}).
+    parse_subopt(Opts, Result#{qos := ?QOS_I(QoS)});
+parse_subopt([_ | Opts], Result) ->
+    parse_subopt(Opts, Result).
 
 -spec(publish(client(), topic(), payload()) -> ok | {error, term()}).
 publish(Client, Topic, Payload) when is_binary(Topic) ->
@@ -473,8 +497,9 @@ init([Options]) ->
                                  properties      = #{},
                                  auto_ack        = true,
                                  ack_timeout     = ?DEFAULT_ACK_TIMEOUT,
-                                 retry_interval  = 0,
+                                 retry_interval  = ?DEFAULT_RETRY_INTERVAL,
                                  connect_timeout = ?DEFAULT_CONNECT_TIMEOUT,
+                                 low_mem         = false,
                                  last_packet_id  = 1
                                 }),
     {ok, initialized, init_parse_state(State)}.
@@ -584,6 +609,8 @@ init([{retry_interval, I} | Opts], State) ->
     init(Opts, State#state{retry_interval = timer:seconds(I)});
 init([{bridge_mode, Mode} | Opts], State) when is_boolean(Mode) ->
     init(Opts, State#state{bridge_mode = Mode});
+init([{low_mem, IsLow} | Opts], State) when is_boolean(IsLow) ->
+    init(Opts, State#state{low_mem = IsLow});
 init([_Opt | Opts], State) ->
     init(Opts, State).
 
@@ -895,9 +922,10 @@ connected(cast, ?PACKET(?PINGRESP), State) ->
 connected(cast, ?DISCONNECT_PACKET(ReasonCode, Properties), State) ->
     {stop, {disconnected, ReasonCode, Properties}, State};
 
-connected(info, {timeout, _TRef, keepalive}, State = #state{force_ping = true}) ->
+connected(info, {timeout, _TRef, keepalive}, State = #state{force_ping = true, low_mem = IsLowMem}) ->
     case send(?PACKET(?PINGREQ), State) of
         {ok, NewState} ->
+            IsLowMem andalso erlang:garbage_collect(self(), [{type, major}]),
             {keep_state, ensure_keepalive_timer(NewState)};
         Error -> {stop, Error}
     end;
@@ -909,6 +937,8 @@ connected(info, {timeout, TRef, keepalive},
         true ->
             case send(?PACKET(?PINGREQ), State) of
                 {ok, NewState} ->
+                    {ok, [{send_oct, Val}]} = ConnMod:getstat(Sock, [send_oct]),
+                    put(send_oct, Val),
                     {keep_state, ensure_keepalive_timer(NewState), [hibernate]};
                 Error -> {stop, Error}
             end;
@@ -964,6 +994,10 @@ handle_event(info, {TcpOrSsL, _Sock, Data}, _StateName, State)
     ?LOG(debug, "RECV Data: ~p", [Data], State),
     process_incoming(Data, [], run_sock(State));
 
+handle_event(info, {quic, Data, _Stream, _, _, _}, _StateName, State) ->
+    ?LOG(debug, "RECV Data: ~p", [Data], State),
+    process_incoming(Data, [], run_sock(State));
+
 handle_event(info, {Error, _Sock, Reason}, _StateName, State)
     when Error =:= tcp_error; Error =:= ssl_error ->
     ?LOG(error, "The connection error occured ~p, reason:~p",
@@ -985,6 +1019,23 @@ handle_event(info, {inet_reply, _Sock, ok}, _, _State) ->
 handle_event(info, {inet_reply, _Sock, {error, Reason}}, _, State) ->
     ?LOG(error, "Got tcp error: ~p", [Reason], State),
     {stop, {shutdown, Reason}, State};
+
+handle_event(info, {quic, transport_shutdown, _Stream, Reason}, _, State) ->
+    %% This is just a notify, we can wait for close complete
+    ?LOG(error, "QUIC: transport shutdown: ~p", [Reason], State),
+    keep_state_and_data;
+
+handle_event(info, {quic, closed, _Stream, Reason}, _, State) ->
+    ?LOG(error, "QUIC: transport closed: ~p", [Reason], State),
+    {stop, {shutdown, {closed, Reason}}, State};
+
+handle_event(info, {quic, closed, _Stream}, _, State) ->
+    ?LOG(error, "QUIC: stream closed", [], State),
+    {stop, {shutdown, closed}, State};
+
+handle_event(info, {quic, peer_send_shutdown, _Stream}, _, State) ->
+    ?LOG(error, "QUIC: peer send shutdown", [], State),
+    {stop, {shutdown, closed}, State};
 
 handle_event(info, EventContent = {'EXIT', _Pid, normal}, StateName, State) ->
     ?LOG(info, "State: ~s, Unexpected Event: (info, ~p)",
@@ -1016,11 +1067,18 @@ code_change(_Vsn, State, Data, _Extra) ->
 %%--------------------------------------------------------------------
 %% Internal functions
 %%--------------------------------------------------------------------
+should_ping(emqtt_quic, Sock) ->
+    case emqtt_quic:getstat(Sock, [send_cnt]) of
+        {ok, [{send_cnt, V}]} ->
+            V == put(quic_send_cnt, V) orelse V == undefined;
+        Err ->
+            Err
+    end;
 
 should_ping(ConnMod, Sock) ->
     case ConnMod:getstat(Sock, [send_oct]) of
         {ok, [{send_oct, Val}]} ->
-            OldVal = get(send_oct), put(send_oct, Val),
+            OldVal = put(send_oct, Val),
             OldVal == undefined orelse OldVal == Val;
         Error = {error, _Reason} ->
             Error
@@ -1118,8 +1176,9 @@ timeout_calls(Timeout, Calls) ->
 timeout_calls(Now, Timeout, Calls) ->
     lists:foldl(fun(C = #call{from = From, ts = Ts}, Acc) ->
                     case (timer:now_diff(Now, Ts) div 1000) >= Timeout of
-                        true  -> From ! {error, ack_timeout},
-                                 Acc;
+                        true  ->
+                            gen_statem:reply(From, {error, ack_timeout}),
+                            Acc;
                         false -> [C | Acc]
                     end
                 end, [], Calls).
@@ -1186,7 +1245,7 @@ deliver(#mqtt_msg{qos = QoS, dup = Dup, retain = Retain, packet_id = PacketId,
 
 eval_msg_handler(#state{msg_handler = ?NO_MSG_HDLR,
                         owner = Owner},
-                 disconnected, {ReasonCode, Properties}) ->
+                 disconnected, {ReasonCode, Properties}) when is_integer(ReasonCode) ->
     %% Special handling for disconnected message when there is no handler callback
     Owner ! {disconnected, ReasonCode, Properties},
     ok;
@@ -1200,8 +1259,21 @@ eval_msg_handler(#state{msg_handler = ?NO_MSG_HDLR,
     ok;
 eval_msg_handler(#state{msg_handler = Handler}, Kind, Msg) ->
     F = maps:get(Kind, Handler),
-    _ = F(Msg),
+    _ = apply_handler_function(F, Msg),
     ok.
+
+apply_handler_function(F, Msg)
+  when is_function(F) ->
+    erlang:apply(F, [Msg]);
+apply_handler_function({F, A}, Msg)
+  when is_function(F),
+       is_list(A) ->
+    erlang:apply(F, [Msg] ++ A);
+apply_handler_function({M, F, A}, Msg)
+  when is_atom(M),
+       is_atom(F),
+       is_list(A) ->
+    erlang:apply(M, F, [Msg] ++ A).
 
 packet_to_msg(#mqtt_packet{header   = #mqtt_packet_header{type   = ?PUBLISH,
                                                           dup    = Dup,
@@ -1279,7 +1351,7 @@ process_incoming(Bytes, Packets, State = #state{parse_state = ParseState}) ->
         {more, NParseState} ->
             {keep_state, State#state{parse_state = NParseState}, next_events(Packets)}
     catch
-        error:Error -> {stop, Error}
+        error:Error:Stacktrace -> {stop, {Error, Stacktrace}}
     end.
 
 -compile({inline, [next_events/1]}).
@@ -1304,7 +1376,7 @@ next_packet_id(Id) -> Id + 1.
 
 reason_code_name(I, Ver) when Ver >= ?MQTT_PROTO_V5 ->
     reason_code_name(I);
-reason_code_name(0, _Ver) -> connection_acceptd;
+reason_code_name(0, _Ver) -> connection_accepted;
 reason_code_name(1, _Ver) -> unacceptable_protocol_version;
 reason_code_name(2, _Ver) -> client_identifier_not_valid;
 reason_code_name(3, _Ver) -> server_unavaliable;

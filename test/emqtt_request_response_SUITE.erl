@@ -1,4 +1,5 @@
-%% Copyright (c) 2013-2019 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%--------------------------------------------------------------------
+%% Copyright (c) 2020 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -11,6 +12,7 @@
 %% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 %% See the License for the specific language governing permissions and
 %% limitations under the License.
+%%--------------------------------------------------------------------
 
 -module(emqtt_request_response_SUITE).
 
@@ -22,11 +24,11 @@
 -include_lib("common_test/include/ct.hrl").
 
 init_per_suite(Config) ->
-    emqx_ct_helpers:start_apps([]),
+    ok = emqtt_test_lib:start_emqx(),
     Config.
 
 end_per_suite(_Config) ->
-    emqx_ct_helpers:stop_apps([]).
+    emqtt_test_lib:stop_emqx().
 
 all() ->
     [request_response].

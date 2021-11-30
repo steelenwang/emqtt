@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2019 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -18,6 +18,7 @@
 
 -export([ connect/4
         , send/2
+        , recv/2
         , close/1
         ]).
 
@@ -37,14 +38,14 @@
 -export_type([socket/0, option/0]).
 
 -define(DEFAULT_TCP_OPTIONS, [binary, {packet, raw}, {active, false},
-                              {nodelay, true}, {reuseaddr, true}]).
+                              {nodelay, true}]).
 
 -spec(connect(inet:ip_address() | inet:hostname(),
               inet:port_number(), [option()], timeout())
       -> {ok, socket()} | {error, term()}).
 connect(Host, Port, SockOpts, Timeout) ->
     TcpOpts = merge_opts(?DEFAULT_TCP_OPTIONS,
-			 lists:keydelete(ssl_opts, 1, SockOpts)),
+                         lists:keydelete(ssl_opts, 1, SockOpts)),
     case gen_tcp:connect(Host, Port, TcpOpts, Timeout) of
         {ok, Sock} ->
             case lists:keyfind(ssl_opts, 1, SockOpts) of
@@ -75,7 +76,23 @@ send(Sock, Data) when is_port(Sock) ->
         error:badarg -> {error, einval}
     end;
 send(#ssl_socket{ssl = SslSock}, Data) ->
-    ssl:send(SslSock, Data).
+    ssl:send(SslSock, Data);
+send(QuicStream, Data) when is_reference(QuicStream) ->
+    case quicer:send(QuicStream, Data) of
+        {ok, _Len} ->
+            ok;
+        Other ->
+            Other
+    end.
+
+-spec(recv(socket(), non_neg_integer())
+      -> {ok, iodata()} | {error, closed | inet:posix()}).
+recv(Sock, Length) when is_port(Sock) ->
+    gen_tcp:recv(Sock, Length);
+recv(#ssl_socket{ssl = SslSock}, Length) ->
+    ssl:recv(SslSock, Length);
+recv(QuicStream, Length) when is_reference(QuicStream) ->
+    quicer:recv(QuicStream, Length).
 
 -spec(close(socket()) -> ok).
 close(Sock) when is_port(Sock) ->
@@ -100,7 +117,9 @@ getstat(#ssl_socket{tcp = Sock}, Options) ->
 sockname(Sock) when is_port(Sock) ->
     inet:sockname(Sock);
 sockname(#ssl_socket{ssl = SslSock}) ->
-    ssl:sockname(SslSock).
+    ssl:sockname(SslSock);
+sockname(Sock) when is_reference(Sock)->
+    quicer:sockname(Sock).
 
 -spec(merge_opts(list(), list()) -> list()).
 merge_opts(Defaults, Options) ->
